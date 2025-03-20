@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Zonos Streaming TTS Client</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        textarea {
+            width: 100%;
+            height: 100px;
+            margin-bottom: 10px;
+        }
+        button {
+            padding: 10px 15px;
+            background-color: #4CAF50;
+            color: white;
+            border: none;
+            cursor: pointer;
+        }
+        button:disabled {
+            background-color: #cccccc;
+        }
+        .status {
+            margin-top: 20px;
+            padding: 10px;
+            background-color: #f0f0f0;
+        }
+        #audioContainer {
+            margin-top: 20px;
+        }
+    </style>
+</head>
+<body>
+    <h1>Zonos Streaming TTS</h1>
+    
+    <div>
+        <label for="textInput">Text to speak:</label>
+        <textarea id="textInput">Hello, this is a test of the streaming TTS system.</textarea>
+    </div>
+    
+    <div>
+        <label for="languageSelect">Language:</label>
+        <select id="languageSelect">
+            <option value="en-us">English (US)</option>
+            <option value="fr-fr">French</option>
+            <option value="de">German</option>
+            <option value="ja">Japanese</option>
+            <option value="cmn">Chinese (Mandarin)</option>
+        </select>
+    </div>
+    
+    <div>
+        <label for="speakerFile">Speaker reference (optional):</label>
+        <input type="file" id="speakerFile" accept="audio/*">
+    </div>
+    
+    <button id="generateBtn">Generate Speech</button>
+    
+    <div class="status" id="status">Ready</div>
+    
+    <div id="audioContainer"></div>
+    
+    <script>
+        let socket;
+        let audioQueue = [];
+        let isPlaying = false;
+        let audioContext;
+        let currentAudioElement = null;
+        
+        const generateBtn = document.getElementById('generateBtn');
+        const textInput = document.getElementById('textInput');
+        const languageSelect = document.getElementById('languageSelect');
+        const speakerFile = document.getElementById('speakerFile');
+        const statusDiv = document.getElementById('status');
+        const audioContainer = document.getElementById('audioContainer');
+        
+        // Initialize audio context on user interaction
+        function initAudioContext() {
+            if (!audioContext) {
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            }
+        }
+        
+        function connectWebSocket() {
+            // Connect to the WebSocket server
+            const wsUrl = 'ws://localhost:8765';
+            socket = new WebSocket(wsUrl);
+            
+            socket.onopen = function() {
+                statusDiv.textContent = 'Connected to server';
+                generateBtn.disabled = false;
+            };
+            
+            socket.onclose = function() {
+                statusDiv.textContent = 'Disconnected from server';
+                generateBtn.disabled = true;
+            };
+            
+            socket.onerror = function(error) {
+                statusDiv.textContent = 'WebSocket error: ' + error.message;
+                generateBtn.disabled = true;
+            };
+            
+            socket.onmessage = function(event) {
+                // Check if the message is JSON metadata or binary audio data
+                if (typeof event.data === 'string') {
+                    try {
+                        const data = JSON.parse(event.data);
+                        if (data.type === 'metadata') {
+                            statusDiv.textContent = `Generating audio for: "${data.text}"`;
+                        } else if (data.type === 'end') {
+                            statusDiv.textContent = 'Generation complete';
+                            generateBtn.disabled = false;
+                        } else if (data.type === 'error') {
+                            statusDiv.textContent = 'Error: ' + data.message;
+                            generateBtn.disabled = false;
+                        }
+                    } catch (e) {
+                        console.error('Error parsing JSON:', e);
+                    }
+                } else {
+                    // Binary audio data
+                    const audioBlob = new Blob([event.data], { type: 'audio/mp3' });
+                    const audioUrl = URL.createObjectURL(audioBlob);
+                    
+                    // Add to queue and play if not already playing
+                    audioQueue.push(audioUrl);
+                    if (!isPlaying) {
+                        playNextInQueue();
+                    }
+                }
+            };
+        }
+        
+        function playNextInQueue() {
+            if (audioQueue.length === 0) {
+                isPlaying = false;
+                return;
+            }
+            
+            isPlaying = true;
+            const audioUrl = audioQueue.shift();
+            
+            // Create audio element
+            const audio = new Audio(audioUrl);
+            currentAudioElement = audio;
+            
+            // Clean up previous audio elements to avoid memory leaks
+            while (audioContainer.firstChild) {
+                const oldUrl = audioContainer.firstChild.src;
+                URL.revokeObjectURL(oldUrl);
+                audioContainer.removeChild(audioContainer.firstChild);
+            }
+            
+            audioContainer.appendChild(audio);
+            
+            audio.onended = function() {
+                URL.revokeObjectURL(audioUrl);
+                playNextInQueue();
+            };
+            
+            audio.onerror = function() {
+                console.error('Error playing audio');
+                URL.revokeObjectURL(audioUrl);
+                playNextInQueue();
+            };
+            
+            audio.play().catch(err => {
+                console.error('Error playing audio:', err);
+                playNextInQueue();
+            });
+        }
+        
+        generateBtn.addEventListener('click', function() {
+            initAudioContext();
+            
+            // Clear any existing audio
+            audioQueue = [];
+            if (currentAudioElement) {
+                currentAudioElement.pause();
+                currentAudioElement = null;
+            }
+            
+            while (audioContainer.firstChild) {
+                const oldUrl = audioContainer.firstChild.src;
+                URL.revokeObjectURL(oldUrl);
+                audioContainer.removeChild(audioContainer.firstChild);
+            }
+            
+            generateBtn.disabled = true;
+            statusDiv.textContent = 'Generating...';
+            
+            // Prepare request data
+            const requestData = {
+                type: 'generate',
+                text: textInput.value,
+                language: languageSelect.value
+            };
+            
+            // If a speaker file is selected, we'd need to upload it first
+            // For simplicity, we're assuming the server has access to speaker files
+            // In a real implementation, you'd upload the file first
+            
+            // Send the request
+            socket.send(JSON.stringify(requestData));
+        });
+        
+        // Connect when the page loads
+        window.addEventListener('load', connectWebSocket);
+    </script>
+</body>
+</html> 
