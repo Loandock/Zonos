@@ -22,6 +22,7 @@
             color: white;
             border: none;
             cursor: pointer;
+            margin-right: 10px;
         }
         button:disabled {
             background-color: #cccccc;
@@ -40,8 +41,8 @@
     <h1>Zonos Streaming TTS</h1>
     
     <div>
-        <label for="textInput">Text to speak:</label>
-        <textarea id="textInput">Hello, this is a test of the streaming TTS system.</textarea>
+        <label for="textInput">Type text to speak in real-time:</label>
+        <textarea id="textInput" placeholder="Start typing to generate speech..."></textarea>
     </div>
     
     <div>
@@ -55,12 +56,8 @@
         </select>
     </div>
     
-    <div>
-        <label for="speakerFile">Speaker reference (optional):</label>
-        <input type="file" id="speakerFile" accept="audio/*">
-    </div>
-    
-    <button id="generateBtn">Generate Speech</button>
+    <button id="startBtn">Start Session</button>
+    <button id="endBtn" disabled>End Session</button>
     
     <div class="status" id="status">Ready</div>
     
@@ -72,11 +69,14 @@
         let isPlaying = false;
         let audioContext;
         let currentAudioElement = null;
+        let sessionActive = false;
+        let lastSentText = "";
+        let typingTimer;
         
-        const generateBtn = document.getElementById('generateBtn');
+        const startBtn = document.getElementById('startBtn');
+        const endBtn = document.getElementById('endBtn');
         const textInput = document.getElementById('textInput');
         const languageSelect = document.getElementById('languageSelect');
-        const speakerFile = document.getElementById('speakerFile');
         const statusDiv = document.getElementById('status');
         const audioContainer = document.getElementById('audioContainer');
         
@@ -94,17 +94,21 @@
             
             socket.onopen = function() {
                 statusDiv.textContent = 'Connected to server';
-                generateBtn.disabled = false;
+                startBtn.disabled = false;
             };
             
             socket.onclose = function() {
                 statusDiv.textContent = 'Disconnected from server';
-                generateBtn.disabled = true;
+                startBtn.disabled = true;
+                endBtn.disabled = true;
+                sessionActive = false;
             };
             
             socket.onerror = function(error) {
                 statusDiv.textContent = 'WebSocket error: ' + error.message;
-                generateBtn.disabled = true;
+                startBtn.disabled = true;
+                endBtn.disabled = true;
+                sessionActive = false;
             };
             
             socket.onmessage = function(event) {
@@ -116,10 +120,19 @@
                             statusDiv.textContent = `Generating audio for: "${data.text}"`;
                         } else if (data.type === 'end') {
                             statusDiv.textContent = 'Generation complete';
-                            generateBtn.disabled = false;
                         } else if (data.type === 'error') {
                             statusDiv.textContent = 'Error: ' + data.message;
-                            generateBtn.disabled = false;
+                        } else if (data.type === 'session_started') {
+                            statusDiv.textContent = 'Session started. Start typing!';
+                            sessionActive = true;
+                            startBtn.disabled = true;
+                            endBtn.disabled = false;
+                            textInput.focus();
+                        } else if (data.type === 'session_ended') {
+                            statusDiv.textContent = 'Session ended';
+                            sessionActive = false;
+                            startBtn.disabled = false;
+                            endBtn.disabled = true;
                         }
                     } catch (e) {
                         console.error('Error parsing JSON:', e);
@@ -177,7 +190,32 @@
             });
         }
         
-        generateBtn.addEventListener('click', function() {
+        // Handle text input changes with debounce
+        textInput.addEventListener('input', function() {
+            if (!sessionActive) return;
+            
+            clearTimeout(typingTimer);
+            
+            // Set a timer to send the text after a short delay
+            typingTimer = setTimeout(function() {
+                const currentText = textInput.value;
+                const newText = currentText.substring(lastSentText.length);
+                
+                if (newText.length > 0) {
+                    // Send only the new text
+                    const data = {
+                        type: 'add_text',
+                        text: newText
+                    };
+                    console.log("Sending:", JSON.stringify(data));
+                    socket.send(JSON.stringify(data));
+                    
+                    lastSentText = currentText;
+                }
+            }, 100); // 100ms debounce
+        });
+        
+        startBtn.addEventListener('click', function() {
             initAudioContext();
             
             // Clear any existing audio
@@ -193,22 +231,29 @@
                 audioContainer.removeChild(audioContainer.firstChild);
             }
             
-            generateBtn.disabled = true;
-            statusDiv.textContent = 'Generating...';
+            // Reset text tracking
+            textInput.value = "";
+            lastSentText = "";
             
-            // Prepare request data
-            const requestData = {
-                type: 'generate',
-                text: textInput.value,
+            // Start a new session
+            const data = {
+                type: 'start_session',
                 language: languageSelect.value
             };
+            console.log("Sending:", JSON.stringify(data));
+            socket.send(JSON.stringify(data));
+        });
+        
+        endBtn.addEventListener('click', function() {
+            // End the current session
+            const data = {
+                type: 'end_session'
+            };
+            console.log("Sending:", JSON.stringify(data));
+            socket.send(JSON.stringify(data));
             
-            // If a speaker file is selected, we'd need to upload it first
-            // For simplicity, we're assuming the server has access to speaker files
-            // In a real implementation, you'd upload the file first
-            
-            // Send the request
-            socket.send(JSON.stringify(requestData));
+            endBtn.disabled = true;
+            sessionActive = false;
         });
         
         // Connect when the page loads
