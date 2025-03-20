@@ -11,3 +11,13 @@ wheels/
 
 # Misc.
 .ipynb_checkpoints/
+
+stt_venv/
+tts_venv/
+.cursorignore
+.cursorrules
+.cursorignorerules
+.cursorignorefiles
+.cursorignorefolders
+.cursorignorefiles
+.cursorignorefolders
