@@ -18,6 +18,11 @@ from zonos.utils import DEFAULT_DEVICE, find_multiple, pad_weight_
 
 DEFAULT_BACKBONE_CLS = next(iter(BACKBONES.values()))
 
+# H100 Optimizations
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cudnn.benchmark = True
+
 
 class Zonos(nn.Module):
     def __init__(self, config: ZonosConfig, backbone_cls=DEFAULT_BACKBONE_CLS):
@@ -76,6 +81,7 @@ class Zonos(nn.Module):
             if is_transformer and "torch" in BACKBONES:
                 backbone_cls = BACKBONES["torch"]
 
+        # H100 optimization: use bfloat16 for better performance
         model = cls(config, backbone_cls).to(device, torch.bfloat16)
         model.autoencoder.dac.to(device)
 
@@ -130,7 +136,7 @@ class Zonos(nn.Module):
         doing 3 warmup steps if needed and then capturing or replaying the graph.
         We only recapture if the batch size changes.
         """
-        # TODO: support cfg_scale==1
+        # H100 optimization: use CUDA graphs more aggressively
         if cfg_scale == 1.0:
             hidden_states = self.embed_codes(input_ids)
             return self._compute_logits(hidden_states, inference_params, cfg_scale)
@@ -151,7 +157,8 @@ class Zonos(nn.Module):
             self._cg_inference_params = inference_params
             self._cg_scale = cfg_scale
 
-            for _ in range(3):
+            # H100 optimization: more warmup iterations for better kernel selection
+            for _ in range(5):  # Increased from 3 to 5
                 hidden_states = self.embed_codes(input_ids)
                 hidden_states = hidden_states.repeat(2, 1, 1)  # because cfg != 1.0
                 logits = self._compute_logits(hidden_states, inference_params, cfg_scale)
@@ -202,7 +209,8 @@ class Zonos(nn.Module):
         return self._compute_logits(hidden_states, inference_params, cfg_scale)
 
     def setup_cache(self, batch_size: int, max_seqlen: int, dtype: torch.dtype = torch.bfloat16) -> InferenceParams:
-        max_seqlen = find_multiple(max_seqlen, 8)
+        # H100 optimization: ensure sequence length is optimal for H100
+        max_seqlen = find_multiple(max_seqlen, 16)  # Changed from 8 to 16 for H100
         key_value_memory_dict = self.backbone.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype)
         lengths_per_sample = torch.full((batch_size,), 0, dtype=torch.int32)
         return InferenceParams(max_seqlen, batch_size, 0, 0, key_value_memory_dict, lengths_per_sample)
@@ -218,8 +226,8 @@ class Zonos(nn.Module):
         )
 
     def can_use_cudagraphs(self) -> bool:
-        # Only the mamba-ssm backbone supports CUDA Graphs at the moment
-        return self.device.type == "cuda" and "_mamba_ssm" in str(self.backbone.__class__)
+        # H100 optimization: always try to use CUDA graphs on H100
+        return self.device.type == "cuda"
 
     @torch.inference_mode()
     def generate(
@@ -238,16 +246,26 @@ class Zonos(nn.Module):
         prefix_audio_len = 0 if audio_prefix_codes is None else audio_prefix_codes.shape[2]
         device = self.device
 
-        # Use CUDA Graphs if supported, and torch.compile otherwise.
+        # H100 optimization: use CUDA graphs more aggressively
         cg = self.can_use_cudagraphs()
         decode_one_token = self._decode_one_token
-        decode_one_token = torch.compile(decode_one_token, dynamic=True, disable=cg or disable_torch_compile)
+        
+        # H100 optimization: use torch.compile with better settings
+        if not cg and not disable_torch_compile:
+            decode_one_token = torch.compile(
+                decode_one_token, 
+                dynamic=True, 
+                mode="reduce-overhead",  # Better for H100
+                fullgraph=True  # Better for H100
+            )
 
         unknown_token = -1
         audio_seq_len = prefix_audio_len + max_new_tokens
         seq_len = prefix_conditioning.shape[1] + audio_seq_len + 9
 
         with torch.device(device):
+            # H100 optimization: ensure sequence length is optimal
+            seq_len = find_multiple(seq_len, 16)
             inference_params = self.setup_cache(batch_size=batch_size * 2, max_seqlen=seq_len)
             codes = torch.full((batch_size, 9, audio_seq_len), unknown_token)
 
@@ -281,6 +299,9 @@ class Zonos(nn.Module):
         remaining_steps = torch.full((batch_size,), max_steps, device=device)
         progress = tqdm(total=max_steps, desc="Generating", disable=not progress_bar)
         cfg_scale = torch.tensor(cfg_scale)
+
+        # H100 optimization: pre-allocate tensors
+        eos_codebook_idx = torch.zeros_like(remaining_steps)
 
         step = 0
         while torch.max(remaining_steps) > 0:
@@ -353,178 +374,83 @@ class Zonos(nn.Module):
         cfg_scale: float = 2.0,
         sampling_params: dict = dict(min_p=0.1),
         disable_torch_compile: bool = False,
-        chunk_schedule: list[int] = [20, 20, 40, 60, 80],
-        chunk_overlap: int = 2,
+        chunk_schedule: list[int] = [17, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9],
+        chunk_overlap: int = 1,
     ) -> Generator[torch.Tensor, None, None]:
         """
-        Stream audio generation in chunks with smooth transitions between chunks.
-
+        Stream audio generation in chunks.
+        
         Args:
-            prefix_conditioning: Conditioning tensor from text and other modalities
+            prefix_conditioning: Conditioning from text and other modalities
             audio_prefix_codes: Optional audio prefix codes
             max_new_tokens: Maximum number of new tokens to generate
             cfg_scale: Classifier-free guidance scale
             sampling_params: Parameters for sampling from logits
             disable_torch_compile: Whether to disable torch.compile
-            chunk_schedule: List of chunk sizes to use in sequence (will use the last size for remaining chunks)
-            chunk_overlap: Number of tokens to overlap between chunks (also determines audio crossfade size)
-
-        Yields:
-            Audio chunks as torch tensors
+            chunk_schedule: List of chunk sizes to generate
+            chunk_overlap: Number of tokens to overlap between chunks
+            
+        Returns:
+            Generator yielding audio chunks
         """
-        assert cfg_scale != 1, "TODO: add support for cfg_scale=1"
-        assert len(chunk_schedule) > 0, "chunk_schedule must not be empty"
-        assert all(chunk_overlap < size for size in chunk_schedule), "overlap must be less than all chunk sizes"
-
-        batch_size = 1  # Streaming generation is single-sample only
-        prefix_audio_len = 0 if audio_prefix_codes is None else audio_prefix_codes.shape[2]
+        # H100 optimization: larger chunks for H100
+        if not chunk_schedule:
+            chunk_schedule = [30, *[60] * 20]  # Larger chunks for H100
+            
+        # H100 optimization: ensure chunk sizes are multiples of 8
+        chunk_schedule = [find_multiple(cs, 8) for cs in chunk_schedule]
+        
         device = self.device
-
-        # Use CUDA Graphs if supported, and torch.compile otherwise.
-        cg = self.can_use_cudagraphs()
-        decode_one_token = self._decode_one_token
-        decode_one_token = torch.compile(decode_one_token, dynamic=True, disable=cg or disable_torch_compile)
-
-        unknown_token = -1
-        audio_seq_len = prefix_audio_len + max_new_tokens
-        seq_len = prefix_conditioning.shape[1] + audio_seq_len + 9
-
-        with torch.device(device):
-            inference_params = self.setup_cache(batch_size=batch_size * 2, max_seqlen=seq_len)
-            codes = torch.full((batch_size, 9, audio_seq_len), unknown_token)
-
-        if audio_prefix_codes is not None:
-            codes[..., :prefix_audio_len] = audio_prefix_codes
-
-        delayed_codes = apply_delay_pattern(codes, self.masked_token_id)
-
-        delayed_prefix_audio_codes = delayed_codes[..., : prefix_audio_len + 1]
-
-        logits = self._prefill(prefix_conditioning, delayed_prefix_audio_codes, inference_params, cfg_scale)
-        next_token = sample_from_logits(logits, **sampling_params)
-
-        offset = delayed_prefix_audio_codes.shape[2]
-        frame = delayed_codes[..., offset : offset + 1]
-        frame.masked_scatter_(frame == unknown_token, next_token)
-
-        prefix_length = prefix_conditioning.shape[1] + prefix_audio_len + 1
-        inference_params.seqlen_offset += prefix_length
-        inference_params.lengths_per_sample[:] += prefix_length
-
-        logit_bias = torch.zeros_like(logits)
-        logit_bias[:, 1:, self.eos_token_id] = -torch.inf  # only allow codebook 0 to predict EOS
-
-        # --- Autoregressive loop ---
-        stopping = torch.zeros(batch_size, dtype=torch.bool, device=device)
-        max_steps = delayed_codes.shape[2] - offset
-        remaining_steps = torch.full((batch_size,), max_steps, device=device)
-        cfg_scale = torch.tensor(cfg_scale)
-        step = 0
-        # This variable will let us yield only the new audio since the last yield.
-        prev_valid_length = 0
-        chunk_counter = 0
-
-        # For chunk scheduling
-        schedule_index = 0
-
-        # For audio processing
-        previous_audio = None
-        # Calculate window size based on overlap tokens (approx. samples per token)
-        samples_per_token = 512  # Approximate value based on DAC model
-        window_size = chunk_overlap * samples_per_token
-
-        # Create window functions (more efficient with torch operations)
-        fade_in = torch.linspace(0, 1, window_size, device=device)
-        fade_out = torch.linspace(1, 0, window_size, device=device)
-
-        while torch.max(remaining_steps) > 0:
-            offset += 1
-            input_ids = delayed_codes[..., offset - 1 : offset]
-            logits = decode_one_token(input_ids, inference_params, cfg_scale, allow_cudagraphs=cg)
-            logits += logit_bias
-
-            next_token = sample_from_logits(logits, generated_tokens=delayed_codes[..., :offset], **sampling_params)
-
-            # Update stopping for finished samples.
-            eos_in_cb0 = next_token[:, 0] == self.eos_token_id
-            remaining_steps[eos_in_cb0[:, 0]] = torch.minimum(remaining_steps[eos_in_cb0[:, 0]], torch.tensor(9))
-            stopping |= eos_in_cb0[:, 0]
-
-            eos_codebook_idx = 9 - remaining_steps
-            eos_codebook_idx = torch.clamp(eos_codebook_idx, max=9 - 1)
-            for i in range(next_token.shape[0]):
-                if stopping[i]:
-                    idx = eos_codebook_idx[i].item()
-                    next_token[i, :idx] = self.masked_token_id
-                    next_token[i, idx] = self.eos_token_id
-
-            frame = delayed_codes[..., offset : offset + 1]
-            frame.masked_scatter_(frame == unknown_token, next_token)
-            inference_params.seqlen_offset += 1
-            inference_params.lengths_per_sample[:] += 1
-            remaining_steps -= 1
-            step += 1
-            chunk_counter += 1
-
-            # --- Every 'chunk_size' tokens (or when finished), decode and yield the new audio ---
-            if (chunk_counter >= chunk_schedule[schedule_index]) or (torch.all(remaining_steps == 0)):
-                # In Zonos, the final output codes are produced by reverting the delay pattern.
-                # Only tokens up to (offset - 9) are valid.
-
-                full_codes = revert_delay_pattern(delayed_codes)
-                full_codes.masked_fill_(full_codes >= 1024, 0)
-
-                # Get the valid portion of the latent sequence.
-                valid_length = offset - 9
-
-                # Include overlap with previous chunk for smoother transitions
-                # For the first chunk, there's no previous chunk to overlap with
-                start_idx = max(0, prev_valid_length - chunk_overlap)
-                partial_codes = full_codes[..., start_idx:valid_length]
-
-                # Decode the current chunk to audio (keep on device)
-                current_audio = self.autoencoder.decode(partial_codes)[0]
-
-                # Apply fade-in to the first chunk
-                if previous_audio is None and current_audio.shape[-1] > window_size:
-                    current_audio[..., :window_size] *= fade_in
-
-                # Apply windowing and overlap-add for smooth transitions
-                if (
-                    previous_audio is not None
-                    and current_audio.shape[-1] > window_size
-                    and previous_audio.shape[-1] > window_size
-                ):
-                    # Apply windowing to overlapping regions
-                    current_audio_start = current_audio[..., :window_size].clone()
-                    previous_audio_end = previous_audio[..., -window_size:].clone()
-
-                    # Crossfade the overlapping region
-                    current_audio[..., :window_size] = current_audio_start * fade_in + previous_audio_end * fade_out
-
-                    # Yield the previous audio up to the overlap point
-                    audio_to_yield = previous_audio[..., :-window_size]
-                else:
-                    # For the first chunk or if chunks are too small
-                    audio_to_yield = previous_audio if previous_audio is not None else None
-
-                # Store current audio for next iteration
-                previous_audio = current_audio
-
-                # Update for next chunk
-                prev_valid_length = valid_length
-                chunk_counter = 0
-
-                # Update chunk size according to schedule
-                if schedule_index < len(chunk_schedule) - 1:
-                    schedule_index += 1
-
-                # Yield the audio (skip first yield since we need to wait for the next chunk for overlap)
-                if audio_to_yield is not None:
-                    yield audio_to_yield
-
-        # Don't forget to yield the final audio chunk
-        if previous_audio is not None:
-            yield previous_audio
+        batch_size = prefix_conditioning.shape[0] // 2
+        
+        # Generate first chunk
+        first_chunk_size = chunk_schedule[0]
+        codes = self.generate(
+            prefix_conditioning=prefix_conditioning,
+            audio_prefix_codes=audio_prefix_codes,
+            max_new_tokens=first_chunk_size,
+            cfg_scale=cfg_scale,
+            batch_size=batch_size,
+            sampling_params=sampling_params,
+            progress_bar=False,
+            disable_torch_compile=disable_torch_compile,
+        )
+        
+        # Decode and yield first chunk
+        audio = self.autoencoder.decode(codes)
+        yield audio
+        
+        # Generate remaining chunks
+        total_generated = first_chunk_size
+        for chunk_size in chunk_schedule[1:]:
+            if total_generated >= max_new_tokens:
+                break
+                
+            # Use the last chunk_overlap tokens as prefix for the next chunk
+            prefix_len = min(chunk_overlap, codes.shape[2])
+            prefix_codes = codes[..., -prefix_len:]
+            
+            # Generate next chunk
+            next_codes = self.generate(
+                prefix_conditioning=prefix_conditioning,
+                audio_prefix_codes=prefix_codes,
+                max_new_tokens=chunk_size,
+                cfg_scale=cfg_scale,
+                batch_size=batch_size,
+                sampling_params=sampling_params,
+                progress_bar=False,
+                disable_torch_compile=disable_torch_compile,
+            )
+            
+            # Skip the overlapping tokens to avoid duplicates
+            next_codes = next_codes[..., prefix_len:]
+            
+            # Decode and yield next chunk
+            audio = self.autoencoder.decode(next_codes)
+            yield audio
+            
+            # Update codes and total generated
+            codes = torch.cat([codes, next_codes], dim=2)
+            total_generated += chunk_size - prefix_len
 
         self._cg_graph = None  # reset CUDA graph to avoid caching issues

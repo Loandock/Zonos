@@ -12,23 +12,23 @@ from zonos.conditioning import make_cond_dict
 from zonos.utils import DEFAULT_DEVICE as device
 
 # Path to your custom voice sample
-CUSTOM_VOICE_PATH = "/Users/arnavjha/Downloads/sesame_fine_tune.wav"
+CUSTOM_VOICE_PATH = "sesame_fine_tune.wav"
 
-# Load the model once at startup
+# === H100 OPTIMIZATIONS ===
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cudnn.benchmark = True
+
 print("Loading model...")
 model = Zonos.from_pretrained("Zyphra/Zonos-v0.1-transformer", device=device)
 model.requires_grad_(False).eval()
 
-# Pre-load the speaker embedding to save time during generation
+# Pre-load the speaker embedding
 print(f"Loading custom voice from {CUSTOM_VOICE_PATH}...")
 custom_wav, custom_sr = torchaudio.load(CUSTOM_VOICE_PATH)
 
-# Trim to 25 seconds
-max_samples = 25 * custom_sr
-if custom_wav.shape[1] > max_samples:
-    print(f"Trimming audio from {custom_wav.shape[1]/custom_sr:.1f}s to 25s")
-    custom_wav = custom_wav[:, :max_samples]
-
+# Use full audio file for better voice cloning
+print(f"Using full audio file: {custom_wav.shape[1]/custom_sr:.1f}s")
 custom_speaker_embedding = model.make_speaker_embedding(custom_wav, custom_sr)
 print("Custom voice loaded successfully!")
 
@@ -291,33 +291,34 @@ class StreamingTTSSession:
             # Generate and stream audio chunks
             chunk_counter = 0
             
-            # Use optimized chunk schedule for H100
-            stream_generator = model.stream(
-                prefix_conditioning=conditioning,
-                audio_prefix_codes=None,
-                chunk_schedule=[12, 15, 20, 25, 30, 35, 40],  # More aggressive initial chunking
-                chunk_overlap=2,  # Slightly more overlap for smoother transitions
-            )
-            
-            for audio_chunk in stream_generator:
-                if audio_chunk is None:
-                    continue
+            # H100-optimized chunk schedule - larger chunks for better throughput
+            with torch.amp.autocast('cuda', dtype=torch.float16):  # Use FP16 for H100
+                stream_generator = model.stream(
+                    prefix_conditioning=conditioning,
+                    audio_prefix_codes=None,
+                    chunk_schedule=[32, 64, 64, 64, 64, 64, 64, 64],  # H100-optimized larger chunks
+                    chunk_overlap=4,  # Increased overlap for smoother transitions
+                )
+                
+                for audio_chunk in stream_generator:
+                    if audio_chunk is None:
+                        continue
+                        
+                    # Convert to numpy and then to WAV
+                    audio_np = audio_chunk.cpu().numpy().squeeze()
+                    audio_bytes = numpy_to_wav(audio_np, model.autoencoder.sampling_rate)
                     
-                # Convert to numpy and then to WAV
-                audio_np = audio_chunk.cpu().numpy().squeeze()
-                audio_bytes = numpy_to_wav(audio_np, model.autoencoder.sampling_rate)
-                
-                chunk_counter += 1
-                current_time = time.time() - start_time
-                generated_time = audio_np.shape[0] / model.autoencoder.sampling_rate
-                
-                print(f"Sending chunk {chunk_counter}: time {current_time*1000:.0f}ms | generated {generated_time*1000:.0f}ms of audio")
-                
-                # Send audio chunk
-                await self.websocket.send(audio_bytes)
-                
-                # Small delay to allow other tasks to run
-                await asyncio.sleep(0.001)
+                    chunk_counter += 1
+                    current_time = time.time() - start_time
+                    generated_time = audio_np.shape[0] / model.autoencoder.sampling_rate
+                    
+                    print(f"Sending chunk {chunk_counter}: time {current_time*1000:.0f}ms | generated {generated_time*1000:.0f}ms of audio")
+                    
+                    # Send audio chunk
+                    await self.websocket.send(audio_bytes)
+                    
+                    # Small delay to allow other tasks to run
+                    await asyncio.sleep(0.001)
             
             # Send end of stream marker
             await self.websocket.send(json.dumps({"type": "end"}))
@@ -365,6 +366,17 @@ async def handle_websocket(websocket):
                 session = None
                 await websocket.send(json.dumps({"type": "session_ended"}))
                 
+            elif data["type"] == "generate":
+                # One-off generation for compatibility
+                text = data.get("text", "")
+                language = data.get("language", "en-us")
+                if text:
+                    # Create a temporary session and generate the complete text
+                    temp_session = StreamingTTSSession(websocket, language)
+                    await temp_session.add_text(text)
+                    while temp_session.text_buffer:
+                        await temp_session.generate_from_buffer()
+                
     except websockets.exceptions.ConnectionClosed:
         print("Connection closed")
     except Exception as e:
@@ -381,9 +393,15 @@ async def main():
     host = "0.0.0.0"  # Listen on all interfaces
     port = 8765
     
-    print(f"Starting websocket server on {host}:{port}")
+    print(f"Starting H100-optimized websocket server on {host}:{port}")
     async with websockets.serve(handle_websocket, host, port):
         await asyncio.Future()  # Run forever
 
 if __name__ == "__main__":
-    asyncio.run(main()) 
+    # Print CUDA info
+    print(f"CUDA available: {torch.cuda.is_available()}")
+    print(f"CUDA device: {torch.cuda.get_device_name(0)}")
+    print(f"CUDA version: {torch.version.cuda}")
+    print(f"PyTorch version: {torch.__version__}")
+    
+    asyncio.run(main())
