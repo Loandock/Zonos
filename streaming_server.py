@@ -10,12 +10,14 @@ import numpy as np
 from zonos.model import Zonos
 from zonos.conditioning import make_cond_dict
 from zonos.utils import DEFAULT_DEVICE as device
+import torch._dynamo as dynamo
 
 # Path to your custom voice sample
 CUSTOM_VOICE_PATH = "sesame_fine_tune.wav"
 HARDCODED_SPEECH = "Heyy! So... sure lemme walk you through the mortgage process. Basically, we start by looking at your finances, like your credit and income, and then we figure out which loan works best for you. We run these numbers through the underwriter's software to kinda se if they'll let you take it out, you know? It might sound like a lot at first, but I'm here to help you every step of the way. So, if that sounds good, just lemme know, and we can get started right away!"
 
-# === H100 OPTIMIZATIONS ===
+# GH200-specific optimizations
+torch.set_float32_matmul_precision('high')  # Use TF32 for matrix multiplications
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.benchmark = True
@@ -23,6 +25,16 @@ torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
 torch._C._jit_set_profiling_executor(False)
 torch._C._jit_set_profiling_mode(False)
 torch._C._set_graph_executor_optimize(True)
+
+# Grace Hopper specific memory optimization
+torch.cuda.set_per_process_memory_fraction(0.95)  # Use 95% of available GPU memory
+
+# Optimize CUDA kernel launches
+os.environ["CUDA_LAUNCH_BLOCKING"] = "0"
+os.environ["TORCH_COMPILE_PARALLEL"] = "1"
+
+# Pre-compile model with TorchDynamo for GH200
+dynamo.config.cache_size_limit = 512  # Increase cache size for compiled graphs
 
 print("Loading model...")
 model = Zonos.from_pretrained("Zyphra/Zonos-v0.1-transformer", device=device)
