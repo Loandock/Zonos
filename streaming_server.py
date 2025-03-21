@@ -12,38 +12,58 @@ from zonos.conditioning import make_cond_dict
 from zonos.utils import DEFAULT_DEVICE as device
 
 # Path to your custom voice sample
-CUSTOM_VOICE_PATH = "/Users/arnavjha/Downloads/sesame_fine_tune.wav"
+CUSTOM_VOICE_PATH = "sesame_fine_tune.wav"
+HARDCODED_SPEECH = "Heyy! So... sure lemme walk you through the mortgage process. Basically, we start by looking at your finances, like your credit and income, and then we figure out which loan works best for you. We run these numbers through the underwriter's software to kinda se if they'll let you take it out, you know? It might sound like a lot at first, but I'm here to help you every step of the way. So, if that sounds good, just lemme know, and we can get started right away!"
 
-# Load the model once at startup
+# === H100 OPTIMIZATIONS ===
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cudnn.benchmark = True
+torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
+torch._C._jit_set_profiling_executor(False)
+torch._C._jit_set_profiling_mode(False)
+torch._C._set_graph_executor_optimize(True)
+
 print("Loading model...")
 model = Zonos.from_pretrained("Zyphra/Zonos-v0.1-transformer", device=device)
 model.requires_grad_(False).eval()
 
-# Pre-load the speaker embedding to save time during generation
+# Pre-load the speaker embedding
 print(f"Loading custom voice from {CUSTOM_VOICE_PATH}...")
 custom_wav, custom_sr = torchaudio.load(CUSTOM_VOICE_PATH)
 
-# Trim to 25 seconds
-max_samples = 25 * custom_sr
-if custom_wav.shape[1] > max_samples:
-    print(f"Trimming audio from {custom_wav.shape[1]/custom_sr:.1f}s to 25s")
-    custom_wav = custom_wav[:, :max_samples]
-
+# Use full audio file for better voice cloning
+print(f"Using full audio file: {custom_wav.shape[1]/custom_sr:.1f}s")
 custom_speaker_embedding = model.make_speaker_embedding(custom_wav, custom_sr)
 print("Custom voice loaded successfully!")
 
-def numpy_to_wav(audio_array, sampling_rate=44100):
-    """Convert numpy array to WAV bytes"""
-    if audio_array.dtype != np.float32:
-        audio_array = audio_array.astype(np.float32)
+# Pre-allocate WAV buffer pool
+buffer_pool = [BytesIO() for _ in range(10)]
+buffer_idx = 0
+
+def get_next_buffer():
+    global buffer_idx
+    buffer = buffer_pool[buffer_idx]
+    buffer.seek(0)
+    buffer.truncate(0)
+    buffer_idx = (buffer_idx + 1) % len(buffer_pool)
+    return buffer
+
+def numpy_to_wav(audio_tensor, sampling_rate=44100):
+    """Convert tensor to WAV bytes using buffer pool"""
+    if audio_tensor.dim() == 1:
+        audio_tensor = audio_tensor.unsqueeze(0)
     
-    audio_tensor = torch.from_numpy(audio_array).unsqueeze(0)
-    buffer = BytesIO()
-    torchaudio.save(buffer, audio_tensor, sampling_rate, format="wav")
+    buffer = get_next_buffer()
+    torchaudio.save(buffer, audio_tensor.cpu(), sampling_rate, format="wav")
     buffer.seek(0)
     return buffer.read()
 
 class StreamingTTSSession:
+    # Class-level concurrency control
+    MAX_CONCURRENT_GENERATIONS = 3
+    generation_semaphore = asyncio.Semaphore(MAX_CONCURRENT_GENERATIONS)
+    
     def __init__(self, websocket, language="en-us"):
         self.websocket = websocket
         self.language = language
@@ -244,85 +264,110 @@ class StreamingTTSSession:
     async def generate_from_buffer(self):
         """Generate audio from the current text buffer"""
         try:
-            # Get text up to a natural boundary
-            complete_text = self.get_complete_text_chunk()
-            if not complete_text:
-                self.is_generating = False
-                return
-                
-            # Remove the processed text from the buffer
-            self.text_buffer = self.text_buffer[len(complete_text):]
-            
-            print(f"Processing chunk: '{complete_text}'")
-            print(f"Remaining buffer: '{self.text_buffer}'")
-            
-            # Set a random seed for reproducibility
-            torch.manual_seed(421)
-            
-            # Detect content type and adjust parameters
-            content_type = self.detect_content_type(complete_text)
-            
-            # Adjust speaking rate based on content type
-            speaking_rate = 13  # Base rate
-            speaking_rate += content_type['speaking_rate_modifier']
-            
-            # Create conditioning dictionary with optimized parameters for voice cloning
-            print(f"Creating conditioning for text: '{complete_text}'")
-            cond_dict = make_cond_dict(
-                text=complete_text, 
-                speaker=self.speaker_embedding, 
-                language=self.language,
-                fmax=22050,  # Optimal for voice cloning
-                speaking_rate=speaking_rate  # Adjusted based on content type
-            )
-            conditioning = model.prepare_conditioning(cond_dict)
-            
-            # Stream generation parameters
-            print("Starting streaming generation...")
-            start_time = time.time()
-            
-            # Send initial metadata
-            await self.websocket.send(json.dumps({
-                "type": "metadata",
-                "sampling_rate": model.autoencoder.sampling_rate,
-                "text": complete_text
-            }))
-            
-            # Generate and stream audio chunks
-            chunk_counter = 0
-            
-            # Use optimized chunk schedule for H100
-            stream_generator = model.stream(
-                prefix_conditioning=conditioning,
-                audio_prefix_codes=None,
-                chunk_schedule=[12, 15, 20, 25, 30, 35, 40],  # More aggressive initial chunking
-                chunk_overlap=2,  # Slightly more overlap for smoother transitions
-            )
-            
-            for audio_chunk in stream_generator:
-                if audio_chunk is None:
-                    continue
+            # Limit concurrent generations
+            async with StreamingTTSSession.generation_semaphore:
+                # Get text up to a natural boundary
+                complete_text = self.get_complete_text_chunk()
+                if not complete_text:
+                    self.is_generating = False
+                    return
                     
-                # Convert to numpy and then to WAV
-                audio_np = audio_chunk.cpu().numpy().squeeze()
-                audio_bytes = numpy_to_wav(audio_np, model.autoencoder.sampling_rate)
+                # Remove the processed text from the buffer
+                self.text_buffer = self.text_buffer[len(complete_text):]
                 
-                chunk_counter += 1
-                current_time = time.time() - start_time
-                generated_time = audio_np.shape[0] / model.autoencoder.sampling_rate
+                print(f"Processing chunk: '{complete_text}'")
+                print(f"Remaining buffer: '{self.text_buffer}'")
                 
-                print(f"Sending chunk {chunk_counter}: time {current_time*1000:.0f}ms | generated {generated_time*1000:.0f}ms of audio")
+                # Set a random seed for reproducibility
+                torch.manual_seed(421)
                 
-                # Send audio chunk
-                await self.websocket.send(audio_bytes)
+                # Detect content type and adjust parameters
+                content_type = self.detect_content_type(complete_text)
                 
-                # Small delay to allow other tasks to run
-                await asyncio.sleep(0.001)
-            
-            # Send end of stream marker
-            await self.websocket.send(json.dumps({"type": "end"}))
-            print("Streaming completed")
-            
+                # Adjust speaking rate based on content type
+                speaking_rate = 13  # Base rate
+                speaking_rate += content_type['speaking_rate_modifier']
+                
+                # Create conditioning dictionary with optimized parameters for voice cloning
+                print(f"Creating conditioning for text: '{complete_text}'")
+                cond_dict = make_cond_dict(
+                    text=complete_text, 
+                    speaker=self.speaker_embedding, 
+                    language=self.language,
+                    fmax=22050,  # Optimal for voice cloning
+                    speaking_rate=speaking_rate  # Adjusted based on content type
+                )
+                conditioning = model.prepare_conditioning(cond_dict)
+                
+                # Stream generation parameters
+                print("Starting streaming generation...")
+                start_time = time.time()
+                
+                # Send initial metadata
+                await self.websocket.send(json.dumps({
+                    "type": "metadata",
+                    "sampling_rate": model.autoencoder.sampling_rate,
+                    "text": complete_text
+                }))
+                
+                # Generate and stream audio chunks
+                chunk_counter = 0
+                
+                # H100-optimized generation with BFloat16
+                with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+                    stream_generator = model.stream(
+                        prefix_conditioning=conditioning,
+                        audio_prefix_codes=None,
+                        chunk_schedule=[20, *range(10, 150)],  # Dynamic chunk schedule for smoother streaming
+                        chunk_overlap=4,  # Increased overlap for smoother transitions
+                    )
+                    
+                    # Buffer for batching audio chunks
+                    audio_buffer = []
+                    buffer_size_limit = 3  # Number of chunks to batch before sending
+                    buffer_time_limit = 0.05  # Maximum time to hold chunks (in seconds)
+                    last_send_time = time.time()
+                    
+                    for audio_chunk in stream_generator:
+                        if audio_chunk is None:
+                            continue
+                            
+                        # Keep tensor on GPU as long as possible
+                        audio_tensor = audio_chunk
+                        
+                        chunk_counter += 1
+                        current_time = time.time() - start_time
+                        generated_time = audio_tensor.shape[0] / model.autoencoder.sampling_rate
+                        
+                        print(f"Generated chunk {chunk_counter}: time {current_time*1000:.0f}ms | generated {generated_time*1000:.0f}ms of audio")
+                        
+                        # Convert to WAV bytes (only now moving to CPU)
+                        with torch.cuda.stream(torch.cuda.Stream()):  # Non-blocking conversion
+                            audio_bytes = numpy_to_wav(audio_tensor, model.autoencoder.sampling_rate)
+                            
+                        # Add to buffer instead of sending immediately
+                        audio_buffer.append(audio_bytes)
+                        
+                        # Send batched chunks if buffer is full or time limit reached
+                        if len(audio_buffer) >= buffer_size_limit or (time.time() - last_send_time) > buffer_time_limit:
+                            # Concatenate all chunks into a single message
+                            if audio_buffer:
+                                combined_message = b''.join(audio_buffer)
+                                await self.websocket.send(combined_message)
+                                print(f"Sent batch of {len(audio_buffer)} chunks as single message ({len(combined_message)} bytes)")
+                                audio_buffer = []
+                                last_send_time = time.time()
+                    
+                    # Send any remaining chunks in the buffer
+                    if audio_buffer:
+                        combined_message = b''.join(audio_buffer)
+                        await self.websocket.send(combined_message)
+                        print(f"Sent final batch of {len(audio_buffer)} chunks as single message ({len(combined_message)} bytes)")
+                
+                # Send end of stream marker
+                await self.websocket.send(json.dumps({"type": "end"}))
+                print(f"Streaming completed in {(time.time() - start_time)*1000:.0f}ms")
+                
         except Exception as e:
             print(f"Error in generation: {e}")
             import traceback
@@ -343,6 +388,13 @@ async def handle_websocket(websocket):
         # Create a streaming session for this connection
         session = None
         
+        # Auto-start with hardcoded text instead of waiting for client
+        print("Auto-starting with hardcoded text (no client input needed)")
+        session = StreamingTTSSession(websocket, "en-us")
+        await session.add_text(HARDCODED_SPEECH)
+        
+        # Comment out the original client handling code
+        """
         async for message in websocket:
             data = json.loads(message)
             
@@ -365,6 +417,21 @@ async def handle_websocket(websocket):
                 session = None
                 await websocket.send(json.dumps({"type": "session_ended"}))
                 
+            elif data["type"] == "generate":
+                # One-off generation for compatibility
+                text = data.get("text", "")
+                language = data.get("language", "en-us")
+                if text:
+                    # Create a temporary session and generate the complete text
+                    temp_session = StreamingTTSSession(websocket, language)
+                    await temp_session.add_text(text)
+                    while temp_session.text_buffer:
+                        await temp_session.generate_from_buffer()
+        """
+                
+        # Keep the server running after generating the hardcoded text
+        await asyncio.Future()
+                
     except websockets.exceptions.ConnectionClosed:
         print("Connection closed")
     except Exception as e:
@@ -381,9 +448,15 @@ async def main():
     host = "0.0.0.0"  # Listen on all interfaces
     port = 8765
     
-    print(f"Starting websocket server on {host}:{port}")
+    print(f"Starting H100-optimized websocket server on {host}:{port}")
     async with websockets.serve(handle_websocket, host, port):
         await asyncio.Future()  # Run forever
 
 if __name__ == "__main__":
-    asyncio.run(main()) 
+    # Print CUDA info
+    print(f"CUDA available: {torch.cuda.is_available()}")
+    print(f"CUDA device: {torch.cuda.get_device_name(0)}")
+    print(f"CUDA version: {torch.version.cuda}")
+    print(f"PyTorch version: {torch.__version__}")
+    
+    asyncio.run(main())

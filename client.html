@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+<!-- <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -35,10 +35,29 @@
         #audioContainer {
             margin-top: 20px;
         }
+        .metrics {
+            margin-top: 10px;
+            font-size: 0.9em;
+            color: #666;
+        }
+        .progress-container {
+            width: 100%;
+            background-color: #f1f1f1;
+            margin-top: 10px;
+            border-radius: 4px;
+            display: none;
+        }
+        .progress-bar {
+            height: 20px;
+            background-color: #4CAF50;
+            border-radius: 4px;
+            width: 0%;
+            transition: width 0.3s;
+        }
     </style>
 </head>
 <body>
-    <h1>Zonos Streaming TTS</h1>
+    <h1>Zonos H100 Optimized TTS</h1>
     
     <div>
         <label for="textInput">Type text to speak in real-time:</label>
@@ -56,29 +75,43 @@
         </select>
     </div>
     
-    <button id="startBtn">Start Session</button>
-    <button id="endBtn" disabled>End Session</button>
+    <div>
+        <button id="startBtn">Start Session</button>
+        <button id="endBtn" disabled>End Session</button>
+        <button id="generateBtn">Generate Speech</button>
+    </div>
     
     <div class="status" id="status">Ready</div>
+    <div class="progress-container" id="progressContainer">
+        <div class="progress-bar" id="progressBar"></div>
+    </div>
+    <div class="metrics" id="metrics"></div>
     
     <div id="audioContainer"></div>
     
     <script>
         let socket;
-        let audioQueue = [];
+        let audioChunks = [];
         let isPlaying = false;
         let audioContext;
         let currentAudioElement = null;
         let sessionActive = false;
         let lastSentText = "";
         let typingTimer;
+        let generationStartTime = 0;
+        let totalAudioDuration = 0;
+        let receivedChunks = 0;
         
         const startBtn = document.getElementById('startBtn');
         const endBtn = document.getElementById('endBtn');
+        const generateBtn = document.getElementById('generateBtn');
         const textInput = document.getElementById('textInput');
         const languageSelect = document.getElementById('languageSelect');
         const statusDiv = document.getElementById('status');
         const audioContainer = document.getElementById('audioContainer');
+        const metricsDiv = document.getElementById('metrics');
+        const progressContainer = document.getElementById('progressContainer');
+        const progressBar = document.getElementById('progressBar');
         
         // Initialize audio context on user interaction
         function initAudioContext() {
@@ -89,25 +122,32 @@
         
         function connectWebSocket() {
             // Connect to the WebSocket server
-            const wsUrl = 'ws://localhost:8765';
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const host = window.location.hostname || 'localhost';
+            const port = 8765;
+            const wsUrl = `${protocol}//${host}:${port}`;
             socket = new WebSocket(wsUrl);
             
             socket.onopen = function() {
                 statusDiv.textContent = 'Connected to server';
                 startBtn.disabled = false;
+                generateBtn.disabled = false;
             };
             
             socket.onclose = function() {
                 statusDiv.textContent = 'Disconnected from server';
                 startBtn.disabled = true;
                 endBtn.disabled = true;
+                generateBtn.disabled = true;
                 sessionActive = false;
+                setTimeout(connectWebSocket, 3000); // Try to reconnect
             };
             
             socket.onerror = function(error) {
                 statusDiv.textContent = 'WebSocket error: ' + error.message;
                 startBtn.disabled = true;
                 endBtn.disabled = true;
+                generateBtn.disabled = true;
                 sessionActive = false;
             };
             
@@ -117,36 +157,86 @@
                     try {
                         const data = JSON.parse(event.data);
                         if (data.type === 'metadata') {
-                            statusDiv.textContent = `Generating audio for: "${data.text}"`;
+                            statusDiv.textContent = `Generating audio for: "${data.text.substring(0, 50)}${data.text.length > 50 ? '...' : ''}"`;
+                            generationStartTime = performance.now();
+                            totalAudioDuration = 0;
+                            receivedChunks = 0;
+                            progressContainer.style.display = 'block';
+                            progressBar.style.width = '0%';
                         } else if (data.type === 'end') {
+                            const generationTime = (performance.now() - generationStartTime) / 1000;
+                            const speedup = totalAudioDuration / generationTime;
+                            
                             statusDiv.textContent = 'Generation complete';
+                            metricsDiv.textContent = `Generated ${totalAudioDuration.toFixed(2)}s of audio in ${generationTime.toFixed(2)}s (${speedup.toFixed(1)}x realtime)`;
+                            generateBtn.disabled = false;
+                            progressBar.style.width = '100%';
+                            
+                            // Create a single audio element with all chunks
+                            if (audioChunks.length > 0) {
+                                const combinedBlob = new Blob(audioChunks, { type: 'audio/wav' });
+                                const audioUrl = URL.createObjectURL(combinedBlob);
+                                
+                                // Create audio element
+                                const audio = new Audio(audioUrl);
+                                audio.controls = true;
+                                
+                                // Clean up previous audio elements
+                                while (audioContainer.firstChild) {
+                                    const oldUrl = audioContainer.firstChild.src;
+                                    URL.revokeObjectURL(oldUrl);
+                                    audioContainer.removeChild(audioContainer.firstChild);
+                                }
+                                
+                                audioContainer.appendChild(audio);
+                                
+                                // Auto-play
+                                audio.play().catch(err => {
+                                    console.error('Error auto-playing audio:', err);
+                                });
+                            }
+                            
+                            // Reset for next generation
+                            audioChunks = [];
                         } else if (data.type === 'error') {
                             statusDiv.textContent = 'Error: ' + data.message;
+                            generateBtn.disabled = false;
+                            startBtn.disabled = false;
+                            endBtn.disabled = sessionActive;
+                            progressContainer.style.display = 'none';
                         } else if (data.type === 'session_started') {
                             statusDiv.textContent = 'Session started. Start typing!';
                             sessionActive = true;
                             startBtn.disabled = true;
                             endBtn.disabled = false;
+                            generateBtn.disabled = true;
                             textInput.focus();
                         } else if (data.type === 'session_ended') {
                             statusDiv.textContent = 'Session ended';
                             sessionActive = false;
                             startBtn.disabled = false;
                             endBtn.disabled = true;
+                            generateBtn.disabled = false;
                         }
                     } catch (e) {
                         console.error('Error parsing JSON:', e);
                     }
                 } else {
-                    // Binary audio data
-                    const audioBlob = new Blob([event.data], { type: 'audio/mp3' });
-                    const audioUrl = URL.createObjectURL(audioBlob);
+                    // Binary audio data - collect chunks
+                    receivedChunks++;
+                    audioChunks.push(event.data);
                     
-                    // Add to queue and play if not already playing
-                    audioQueue.push(audioUrl);
-                    if (!isPlaying) {
-                        playNextInQueue();
-                    }
+                    // Estimate audio duration (rough approximation)
+                    // WAV format is much more predictable than MP3
+                    const chunkSizeBytes = event.data.size;
+                    const estimatedDurationSec = chunkSizeBytes / (44100 * 2); // 16-bit mono at 44.1kHz
+                    totalAudioDuration += estimatedDurationSec;
+                    
+                    // Update progress (rough approximation)
+                    const progress = Math.min(receivedChunks * 10, 90); // Cap at 90% until complete
+                    progressBar.style.width = progress + '%';
+                    
+                    statusDiv.textContent = `Received chunk ${receivedChunks}`;
                 }
             };
         }
@@ -219,7 +309,7 @@
             initAudioContext();
             
             // Clear any existing audio
-            audioQueue = [];
+            audioChunks = [];
             if (currentAudioElement) {
                 currentAudioElement.pause();
                 currentAudioElement = null;
@@ -256,8 +346,41 @@
             sessionActive = false;
         });
         
+        generateBtn.addEventListener('click', function() {
+            initAudioContext();
+            
+            // Clear any existing audio
+            audioChunks = [];
+            if (currentAudioElement) {
+                currentAudioElement.pause();
+                currentAudioElement = null;
+            }
+            
+            while (audioContainer.firstChild) {
+                const oldUrl = audioContainer.firstChild.src;
+                URL.revokeObjectURL(oldUrl);
+                audioContainer.removeChild(audioContainer.firstChild);
+            }
+            
+            generateBtn.disabled = true;
+            statusDiv.textContent = 'Generating...';
+            metricsDiv.textContent = '';
+            progressContainer.style.display = 'block';
+            progressBar.style.width = '0%';
+            
+            // Send the generation request
+            const requestData = {
+                type: 'generate',
+                text: textInput.value,
+                language: languageSelect.value
+            };
+            
+            // Send the request
+            socket.send(JSON.stringify(requestData));
+        });
+        
         // Connect when the page loads
         window.addEventListener('load', connectWebSocket);
     </script>
 </body>
-</html> 
+</html> -->
