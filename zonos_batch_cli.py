@@ -17,7 +17,7 @@ def generate_audio(args, model, speaker_embedding, prefix_audio_codes):
     """Generates speech for multiple texts in a batch."""
     torch.manual_seed(args.seed)
     batch_size = len(args.text)
-    
+
     # Expand speaker embedding for batch size
     # speaker_embedding = speaker_embedding.expand(batch_size, speaker_embedding.size(1), speaker_embedding.size(2))
     # speaker_embedding = speaker_embedding.expand(batch_size, -1)
@@ -39,14 +39,14 @@ def generate_audio(args, model, speaker_embedding, prefix_audio_codes):
       )
 
     prefix_conditioning = model.prepare_conditioning(cond_dict)
-        
+
     # Expand prefix_audio_codes to batch size
     prefix_audio_codes = prefix_audio_codes.expand(batch_size, prefix_audio_codes.size(1), prefix_audio_codes.size(2))
 
     print ("conditioning.size(): ", prefix_conditioning.size())
     print ("speaker_embedding.size(): ", speaker_embedding.size())
     print ("prefix_audio_codes.size(): ", prefix_audio_codes.size())
-    
+
     # Generate codes
     codes = model.generate(
         prefix_conditioning,
@@ -95,7 +95,7 @@ def main():
     parser.add_argument("--prefix_audio", default=None, help="Path to prefix audio (default: 100ms silence).")
     parser.add_argument("--output", default="output.wav", help="Output wav file prefix.")
     parser.add_argument("--seed", type=int, default=423, help="Random seed for reproducibility.")
- 
+
     # Conditioning parameters
     parser.add_argument("--emotion", nargs=8, type=float, default=[1.0, 0.05, 0.05, 0.05, 0.05, 0.05, 0.1, 0.2], help="Emotion vector (Happiness, Sadness, Disgust, Fear, Surprise, Anger, Other, Neutral).")
     parser.add_argument("--fmax", type=float, default=22050.0, help="Max frequency (0-24000).")
@@ -106,7 +106,7 @@ def main():
     parser.add_argument("--dnsmos_ovrl", type=float, default=4.0, help="DNSMOS overall score.")
     parser.add_argument("--speaker_noised", action='store_true', help="Apply speaker noise.")
     parser.add_argument("--unconditional_keys", nargs='*', default=["emotion", "vqscore_8", "dnsmos_ovrl"], help="Unconditional keys.")
-        
+
     # Model generation parameters
     parser.add_argument("--max_new_tokens", type=int, default=86 * 30, help="Max new tokens.")
     parser.add_argument("--cfg_scale", type=float, default=2.0, help="CFG scale.")
@@ -120,26 +120,26 @@ def main():
     parser.add_argument("--repetition_penalty_window", type=int, default=3, help="Repetition penalty window.")
     parser.add_argument("--temperature", type=float, default=1.0, help="Temperature scaling.")
     parser.add_argument("--progress_bar", default=True, action="store_true", help="Show progress bar.")
-    
+
     args = parser.parse_args()
 
     print("Loading Zonos model...")
     model = Zonos.from_pretrained("Zyphra/Zonos-v0.1-transformer", device=device)
     # model = Zonos.from_pretrained("Zyphra/Zonos-v0.1-hybrid", device=device) # only GPU
-    
+
     print("Loading speaker reference audio...")
     wav, sr = torchaudio.load(args.reference_audio)
     speaker_embedding = model.make_speaker_embedding(wav, sr)
-    
+
     print("Loading prefix audio...")
     if args.prefix_audio:
         prefix_audio_codes = load_audio(args.prefix_audio, model)
     else:
-        silence_path = "assets/silence_100ms.wav"  # Ensure this file exists
+        silence_path = "assets/silence_350ms.wav"  # Ensure this file exists
         prefix_audio_codes = load_audio(silence_path, model)
-    
+
     print("Generating speech...")
     generate_audio(args, model, speaker_embedding, prefix_audio_codes)
-    
+
 if __name__ == "__main__":
     main()
