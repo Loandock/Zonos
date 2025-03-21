@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>TTS Stream Player</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f7f7f7;
+        }
+        h1 {
+            color: #333;
+        }
+        #audioPlayer {
+            width: 100%;
+            margin: 20px 0;
+        }
+        .stats {
+            background-color: #fff;
+            border-radius: 8px;
+            padding: 15px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            margin: 20px 0;
+        }
+        .stat-row {
+            display: flex;
+            margin: 10px 0;
+        }
+        .stat-label {
+            font-weight: bold;
+            width: 200px;
+        }
+        .log {
+            background-color: #282c34;
+            color: #abb2bf;
+            font-family: monospace;
+            padding: 15px;
+            border-radius: 8px;
+            height: 250px;
+            overflow-y: auto;
+            margin-top: 20px;
+        }
+        .log-entry {
+            margin: 3px 0;
+            line-height: 1.4;
+        }
+        .timestamp {
+            color: #98c379;
+        }
+        .audio-chunk {
+            color: #61afef;
+        }
+        .metadata {
+            color: #c678dd;
+        }
+        button {
+            background-color: #4b5efc;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 6px;
+            font-size: 16px;
+            cursor: pointer;
+            margin-right: 10px;
+        }
+        button:hover {
+            background-color: #3a4cd8;
+        }
+    </style>
+</head>
+<body>
+    <h1>TTS Stream Player</h1>
+    
+    <div>
+        <button id="connectBtn">Connect to TTS Server</button>
+        <button id="clearLogBtn">Clear Log</button>
+    </div>
+    
+    <audio id="audioPlayer" controls autoplay></audio>
+    
+    <div class="stats">
+        <h2>Performance Metrics</h2>
+        <div class="stat-row">
+            <div class="stat-label">Total chunks received:</div>
+            <div id="totalChunks">0</div>
+        </div>
+        <div class="stat-row">
+            <div class="stat-label">Time to first chunk:</div>
+            <div id="timeToFirst">-</div>
+        </div>
+        <div class="stat-row">
+            <div class="stat-label">Avg time between chunks:</div>
+            <div id="avgTimeBetween">-</div>
+        </div>
+        <div class="stat-row">
+            <div class="stat-label">Total session time:</div>
+            <div id="totalTime">-</div>
+        </div>
+    </div>
+    
+    <h2>Console Log</h2>
+    <div id="log" class="log"></div>
+    
+    <script>
+        // Elements
+        const audioPlayer = document.getElementById('audioPlayer');
+        const logContainer = document.getElementById('log');
+        const connectBtn = document.getElementById('connectBtn');
+        const clearLogBtn = document.getElementById('clearLogBtn');
+        const totalChunksEl = document.getElementById('totalChunks');
+        const timeToFirstEl = document.getElementById('timeToFirst');
+        const avgTimeBetweenEl = document.getElementById('avgTimeBetween');
+        const totalTimeEl = document.getElementById('totalTime');
+        
+        // State
+        let websocket = null;
+        let isConnected = false;
+        let sessionStartTime = null;
+        let firstChunkTime = null;
+        let lastChunkTime = null;
+        let chunkTimes = [];
+        let totalChunks = 0;
+        
+        // Add log entry with timestamp
+        function log(message, type = '') {
+            const timestamp = new Date().toTimeString().split(' ')[0] + '.' + 
+                              new Date().getMilliseconds().toString().padStart(3, '0');
+            
+            const elapsed = sessionStartTime ? 
+                ((Date.now() - sessionStartTime) / 1000).toFixed(3) + 's' : '-';
+            
+            const entry = document.createElement('div');
+            entry.className = 'log-entry ' + type;
+            entry.innerHTML = `<span class="timestamp">[${timestamp}]</span> <span class="elapsed">[${elapsed}]</span> ${message}`;
+            
+            logContainer.appendChild(entry);
+            logContainer.scrollTop = logContainer.scrollHeight;
+            
+            // Also log to console
+            console.log(`[${timestamp}] [${elapsed}] ${message}`);
+        }
+        
+        // Update statistics
+        function updateStats() {
+            totalChunksEl.textContent = totalChunks;
+            
+            if (sessionStartTime) {
+                const totalMs = Date.now() - sessionStartTime;
+                totalTimeEl.textContent = (totalMs / 1000).toFixed(3) + 's';
+                
+                if (firstChunkTime) {
+                    const ttfMs = firstChunkTime - sessionStartTime;
+                    timeToFirstEl.textContent = (ttfMs / 1000).toFixed(3) + 's';
+                    
+                    if (chunkTimes.length > 1) {
+                        let totalGap = 0;
+                        for (let i = 1; i < chunkTimes.length; i++) {
+                            totalGap += chunkTimes[i] - chunkTimes[i-1];
+                        }
+                        const avgMs = totalGap / (chunkTimes.length - 1);
+                        avgTimeBetweenEl.textContent = (avgMs / 1000).toFixed(3) + 's';
+                    }
+                }
+            }
+        }
+        
+        // Connect to WebSocket server
+        function connect() {
+            if (isConnected) {
+                websocket.close();
+                return;
+            }
+            
+            // Reset stats
+            sessionStartTime = Date.now();
+            firstChunkTime = null;
+            lastChunkTime = null;
+            chunkTimes = [];
+            totalChunks = 0;
+            updateStats();
+            
+            log('Connecting to TTS server...');
+            
+            // Connect to the Lambda TTS server
+            websocket = new WebSocket('ws://192.222.56.242:8765');
+            
+            websocket.onopen = function() {
+                isConnected = true;
+                connectBtn.textContent = 'Disconnect';
+                log('Connected to TTS server', 'metadata');
+            };
+            
+            websocket.onclose = function() {
+                isConnected = false;
+                connectBtn.textContent = 'Connect to TTS Server';
+                log('Disconnected from TTS server', 'metadata');
+                
+                // Calculate final stats
+                if (totalChunks > 0) {
+                    log('=========== SESSION COMPLETE ===========', 'metadata');
+                    log(`Total chunks: ${totalChunks}`, 'metadata');
+                    log(`Total time: ${((Date.now() - sessionStartTime)/1000).toFixed(3)}s`, 'metadata');
+                    if (firstChunkTime) {
+                        log(`Time to first chunk: ${((firstChunkTime - sessionStartTime)/1000).toFixed(3)}s`, 'metadata');
+                    }
+                    if (chunkTimes.length > 1) {
+                        let totalGap = 0;
+                        for (let i = 1; i < chunkTimes.length; i++) {
+                            totalGap += chunkTimes[i] - chunkTimes[i-1];
+                        }
+                        const avgMs = totalGap / (chunkTimes.length - 1);
+                        log(`Avg time between chunks: ${(avgMs/1000).toFixed(3)}s`, 'metadata');
+                    }
+                    log('=======================================', 'metadata');
+                }
+            };
+            
+            websocket.onerror = function(error) {
+                log(`WebSocket error: ${error}`, 'metadata');
+            };
+            
+            websocket.onmessage = function(event) {
+                const now = Date.now();
+                
+                if (typeof event.data === 'string') {
+                    // Text message (metadata)
+                    try {
+                        const data = JSON.parse(event.data);
+                        log(`Received metadata: ${JSON.stringify(data)}`, 'metadata');
+                    } catch (e) {
+                        log(`Received text: ${event.data}`, 'metadata');
+                    }
+                } else {
+                    // Binary audio data
+                    totalChunks++;
+                    
+                    if (!firstChunkTime) {
+                        firstChunkTime = now;
+                    }
+                    
+                    const timeSinceLastChunk = lastChunkTime ? now - lastChunkTime : now - sessionStartTime;
+                    lastChunkTime = now;
+                    chunkTimes.push(now);
+                    
+                    const size = event.data.size / 1024;
+                    log(`Chunk #${totalChunks} | ${size.toFixed(1)} KB | +${(timeSinceLastChunk/1000).toFixed(3)}s`, 'audio-chunk');
+                    
+                    // Play the audio
+                    const blob = new Blob([event.data], { type: 'audio/wav' });
+                    const url = URL.createObjectURL(blob);
+                    
+                    // Clean up previous URL after playing
+                    const oldUrl = audioPlayer.src;
+                    if (oldUrl && oldUrl.startsWith('blob:')) {
+                        URL.revokeObjectURL(oldUrl);
+                    }
+                    
+                    audioPlayer.src = url;
+                    audioPlayer.play();
+                    
+                    updateStats();
+                }
+            };
+        }
+        
+        // Event listeners
+        connectBtn.addEventListener('click', connect);
+        
+        clearLogBtn.addEventListener('click', function() {
+            logContainer.innerHTML = '';
+        });
+        
+        // Initial log
+        log('Ready to connect to TTS server');
+    </script>
+</body>
+</html>
