@@ -184,7 +184,7 @@
             log('Connecting to TTS server...');
             
             // Connect to the Lambda TTS server
-            websocket = new WebSocket('ws://192.222.56.242:8765');
+            websocket = new WebSocket('ws://localhost:8765');
             
             websocket.onopen = function() {
                 isConnected = true;

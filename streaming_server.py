@@ -11,6 +11,15 @@ from zonos.model import Zonos
 from zonos.conditioning import make_cond_dict
 from zonos.utils import DEFAULT_DEVICE as device
 import torch._dynamo as dynamo
+import threading
+import functools
+import inspect
+import warnings
+import re
+
+# Suppress common warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning, module="torch.cuda.graphs")
 
 # Path to your custom voice sample
 CUSTOM_VOICE_PATH = "sesame_fine_tune.wav"
@@ -49,6 +58,35 @@ print(f"Using full audio file: {custom_wav.shape[1]/custom_sr:.1f}s")
 custom_speaker_embedding = model.make_speaker_embedding(custom_wav, custom_sr)
 print("Custom voice loaded successfully!")
 
+# Warmup the model for faster first inference
+print("Performing GH200 warmup...")
+with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+    warmup_text = "This is a warmup text to prime the model for faster inference."
+    cond_dict = make_cond_dict(
+        text=warmup_text,
+        speaker=custom_speaker_embedding,
+        language="en-us",
+        fmax=22050
+    )
+    conditioning = model.prepare_conditioning(cond_dict)
+    
+    # Warm up the streaming path
+    stream_generator = model.stream(
+        prefix_conditioning=conditioning,
+        audio_prefix_codes=None,
+        chunk_schedule=[32, 64, 128],
+        chunk_overlap=8,
+    )
+    
+    # Process a few chunks
+    for i, _ in enumerate(stream_generator):
+        if i >= 3:  # Just process a few chunks
+            break
+    
+    # Force synchronization to complete warmup
+    torch.cuda.synchronize()
+print("GH200 warmup complete")
+
 # Pre-allocate WAV buffer pool
 buffer_pool = [BytesIO() for _ in range(10)]
 buffer_idx = 0
@@ -83,34 +121,39 @@ class StreamingTTSSession:
         self.text_buffer = ""
         self.is_generating = False
         self.generation_task = None
-        self.min_words_to_generate = 2  # Wait for at least 2 words before generating
-        self.max_words_per_chunk = 5  # Process at most 5 words at once for faster responses
-        self.sentence_end_markers = ['.', '!', '?', ';', '\n']  # End chunk at these markers
+        self.sentence_end_markers = ['.', '!', '?', '\n']  # Simplified to focus on sentences
         
     async def add_text(self, text):
         """Add text to the buffer and trigger generation if not already running"""
         self.text_buffer += text
         
-        # Only start generation if we have enough complete words and not already generating
-        if not self.is_generating and self.has_enough_complete_words():
+        # Only start generation if we have enough complete text and not already generating
+        if not self.is_generating and self.has_complete_sentence():
             self.is_generating = True
             self.generation_task = asyncio.create_task(self.generate_from_buffer())
     
-    def has_enough_complete_words(self):
-        """Check if we have enough complete words to start generation"""
+    def has_complete_sentence(self):
+        """Check if we have a complete sentence or substantial text"""
         if not self.text_buffer:
             return False
             
-        # Count complete words (separated by spaces)
-        words = self.text_buffer.split()
-        return len(words) >= self.min_words_to_generate
+        # Check for sentence ending markers
+        for marker in self.sentence_end_markers:
+            if marker in self.text_buffer:
+                return True
+                
+        # For longer chunks without sentence markers, consider them complete
+        if len(self.text_buffer.split()) >= 10:  # Longer chunks for GH200
+            return True
+                
+        return False
     
     def get_complete_text_chunk(self):
-        """Get text up to a natural boundary with improved rules for speech synthesis"""
+        """Get text up to a complete sentence, preferring natural breaks"""
         if not self.text_buffer:
             return ""
         
-        # First priority: Check for sentence end markers with improved handling
+        # Try to find complete sentences first
         for marker in self.sentence_end_markers:
             marker_index = self.text_buffer.find(marker)
             if marker_index != -1:
@@ -133,19 +176,6 @@ class StreamingTTSSession:
                                 if marker_index-len(abbrev) == 0 or not self.text_buffer[marker_index-len(abbrev)-1].isalpha():
                                     continue
                 
-                # Handle question and exclamation marks inside quotations or parentheses
-                if marker in ['!', '?']:
-                    # Check if we're inside a quotation or parenthesis
-                    text_before_marker = self.text_buffer[:marker_index]
-                    if (text_before_marker.count('(') > text_before_marker.count(')') or
-                        text_before_marker.count('"') % 2 == 1 or
-                        text_before_marker.count("'") % 2 == 1):
-                        
-                        # Check if there's a closing bracket or quote right after
-                        if marker_index + 1 < len(self.text_buffer) and self.text_buffer[marker_index+1] in [')', '"', "'"]:
-                            # Let's continue to find the end of this parenthetical or quoted expression
-                            continue
-                
                 # Include the marker and any following space
                 end_index = marker_index + 1
                 
@@ -159,76 +189,28 @@ class StreamingTTSSession:
                     
                 return self.text_buffer[:end_index]
         
-        # Check for other natural pause markers like commas, colons, semicolons
-        # but only if we already have enough words to meet minimum length
-        pause_markers = [',', ':', ';']
-        words = self.text_buffer.split()
-        if len(words) >= self.min_words_to_generate:
-            for marker in pause_markers:
-                marker_index = self.text_buffer.find(marker)
+        # If no sentence markers, check for longer chunks of text (GH200 can handle longer chunks)
+        if len(self.text_buffer) > 300:  # Process larger chunks on GH200
+            # Find a good break point like a comma
+            for marker in [',', ';', ':', ' - ']:
+                marker_index = self.text_buffer.rfind(marker, 0, 300)
                 if marker_index != -1:
-                    # Make sure we're not in the middle of a number (e.g. "10,000")
-                    if marker == ',' and marker_index > 0 and marker_index < len(self.text_buffer) - 1:
-                        if self.text_buffer[marker_index-1].isdigit() and self.text_buffer[marker_index+1].isdigit():
-                            continue
-                    
-                    # Include the marker and any following space
                     end_index = marker_index + 1
                     if end_index < len(self.text_buffer) and self.text_buffer[end_index] == ' ':
                         end_index += 1
                     return self.text_buffer[:end_index]
+            
+            # If no good break point, just take a large chunk
+            words = self.text_buffer[:300].split()
+            if len(words) > 1:
+                return " ".join(words[:-1]) + " "  # Return up to the last word to avoid cutting words
+            return self.text_buffer[:300]
         
-        # Handle parenthetical expressions and quotes (complete them if possible)
-        opening_chars = {'(': ')', '"': '"', "'": "'", '[': ']', '{': '}'}
-        for open_char, close_char in opening_chars.items():
-            open_index = self.text_buffer.find(open_char)
-            if open_index != -1:
-                # Look for corresponding closing character
-                close_index = self.text_buffer.find(close_char, open_index + 1)
-                if close_index != -1:
-                    # If we have a complete expression and it's followed by a space, use it
-                    if close_index + 1 < len(self.text_buffer) and self.text_buffer[close_index+1] == ' ':
-                        return self.text_buffer[:close_index+2]  # Include the closing char and space
-        
-        # Second priority: If we have enough words, take a chunk but try to end at a natural point
-        if len(words) >= self.max_words_per_chunk:
-            # Determine how many words to include (up to max_words_per_chunk)
-            chunk_size = min(len(words), self.max_words_per_chunk)
-            
-            # Try to find a good break point in the chunk (prepositions, conjunctions, etc.)
-            good_break_words = ['and', 'or', 'but', 'yet', 'for', 'nor', 'so', 'at', 'by', 'in', 'of', 'on', 'to', 'with']
-            
-            # Start from max_words_per_chunk-1 and work backwards to find a good break point
-            for i in range(chunk_size-1, max(chunk_size-3, 0), -1):  # Look back up to 3 words
-                if words[i].lower() in good_break_words:
-                    chunk_size = i + 1
-                    break
-            
-            # Take exactly chunk_size words
-            chunk_text = " ".join(words[:chunk_size])
-            
-            # Find the actual position in the original text to include any trailing space
-            full_text_pos = len(chunk_text)
-            if full_text_pos < len(self.text_buffer) and self.text_buffer[full_text_pos] == ' ':
-                chunk_text += ' '
-                full_text_pos += 1
-            
-            return self.text_buffer[:full_text_pos]
-        
-        # Third priority: If we have at least min_words and the buffer ends with a space
-        if len(words) >= self.min_words_to_generate and self.text_buffer.endswith(" "):
+        # For shorter text, return if it ends with space (likely a complete phrase)
+        if self.text_buffer.endswith(" ") and len(self.text_buffer.split()) > 3:
             return self.text_buffer
         
-        # Otherwise, find the last space and take everything before it
-        # but only if we have at least min_words
-        last_space_index = self.text_buffer.rfind(" ")
-        if last_space_index != -1:  # Space found
-            text = self.text_buffer[:last_space_index+1]
-            words = text.split()
-            if len(words) >= self.min_words_to_generate:
-                return text
-        
-        # Not enough complete words yet
+        # Otherwise, wait for more text
         return ""
 
     def detect_content_type(self, text):
@@ -258,14 +240,6 @@ class StreamingTTSSession:
         if '!' in text:
             content_type['is_exclamation'] = True
             content_type['speaking_rate_modifier'] = 2  # Faster for excitement
-        
-        # Detect lists (numbered or bulleted)
-        list_indicators = [') ', '. ', '- ', '* ']
-        if any(indicator in text for indicator in list_indicators):
-            for i in range(1, 10):  # Check for numbered lists
-                if f"{i}. " in text or f"{i}) " in text:
-                    content_type['is_list'] = True
-                    break
         
         # Detect numeric content
         if any(char.isdigit() for char in text):
@@ -309,7 +283,6 @@ class StreamingTTSSession:
                     fmax=22050,  # Optimal for voice cloning
                     speaking_rate=speaking_rate  # Adjusted based on content type
                 )
-                conditioning = model.prepare_conditioning(cond_dict)
                 
                 # Stream generation parameters
                 print("Starting streaming generation...")
@@ -325,60 +298,66 @@ class StreamingTTSSession:
                 # Generate and stream audio chunks
                 chunk_counter = 0
                 
-                # H100-optimized generation with BFloat16
-                with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-                    stream_generator = model.stream(
-                        prefix_conditioning=conditioning,
-                        audio_prefix_codes=None,
-                        chunk_schedule=[20, *range(10, 150)],  # Dynamic chunk schedule for smoother streaming
-                        chunk_overlap=4,  # Increased overlap for smoother transitions
-                    )
-                    
-                    # Buffer for batching audio chunks
-                    audio_buffer = []
-                    buffer_size_limit = 3  # Number of chunks to batch before sending
-                    buffer_time_limit = 0.05  # Maximum time to hold chunks (in seconds)
-                    last_send_time = time.time()
-                    
-                    for audio_chunk in stream_generator:
-                        if audio_chunk is None:
-                            continue
+                # GH200-optimized generation with BFloat16
+                with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                    with torch.no_grad():
+                        # Prepare conditioning - do this outside the stream to avoid overhead
+                        conditioning = model.prepare_conditioning(cond_dict)
+                        
+                        # Create a GH200-optimized chunk schedule for maximum efficiency
+                        stream_generator = model.stream(
+                            prefix_conditioning=conditioning,
+                            audio_prefix_codes=None,
+                            chunk_schedule=[64, 128, 256, 512],  # Smaller initial chunks for faster startup
+                            chunk_overlap=8,  # Overlap smaller than smallest chunk
+                        )
+                        
+                        # Buffer for batching audio chunks
+                        audio_buffer = []
+                        buffer_size_limit = 2  # Smaller batches for more frequent updates
+                        buffer_time_limit = 0.05  # Shorter time limit for more responsive delivery
+                        last_send_time = time.time()
+                        
+                        for audio_chunk in stream_generator:
+                            if audio_chunk is None:
+                                continue
+                                
+                            # Keep tensor on GPU as long as possible
+                            audio_tensor = audio_chunk
                             
-                        # Keep tensor on GPU as long as possible
-                        audio_tensor = audio_chunk
-                        
-                        chunk_counter += 1
-                        current_time = time.time() - start_time
-                        generated_time = audio_tensor.shape[0] / model.autoencoder.sampling_rate
-                        
-                        print(f"Generated chunk {chunk_counter}: time {current_time*1000:.0f}ms | generated {generated_time*1000:.0f}ms of audio")
-                        
-                        # Convert to WAV bytes (only now moving to CPU)
-                        with torch.cuda.stream(torch.cuda.Stream()):  # Non-blocking conversion
-                            audio_bytes = numpy_to_wav(audio_tensor, model.autoencoder.sampling_rate)
+                            chunk_counter += 1
+                            current_time = time.time() - start_time
+                            generated_time = audio_tensor.shape[0] / model.autoencoder.sampling_rate
                             
-                        # Add to buffer instead of sending immediately
-                        audio_buffer.append(audio_bytes)
+                            print(f"Generated chunk {chunk_counter}: time {current_time*1000:.0f}ms | generated {generated_time*1000:.0f}ms of audio")
+                            
+                            # Convert to WAV bytes (only now moving to CPU)
+                            with torch.cuda.stream(torch.cuda.Stream(priority=-1)):  # Non-blocking high-priority conversion
+                                audio_bytes = numpy_to_wav(audio_tensor, model.autoencoder.sampling_rate)
+                                
+                            # Add to buffer instead of sending immediately
+                            audio_buffer.append(audio_bytes)
+                            
+                            # Send batched chunks if buffer is full or time limit reached
+                            if len(audio_buffer) >= buffer_size_limit or (time.time() - last_send_time) > buffer_time_limit:
+                                # Concatenate all chunks into a single message
+                                if audio_buffer:
+                                    combined_message = b''.join(audio_buffer)
+                                    await self.websocket.send(combined_message)
+                                    print(f"Sent batch of {len(audio_buffer)} chunks as single message ({len(combined_message)/1024:.1f} KB)")
+                                    audio_buffer = []
+                                    last_send_time = time.time()
                         
-                        # Send batched chunks if buffer is full or time limit reached
-                        if len(audio_buffer) >= buffer_size_limit or (time.time() - last_send_time) > buffer_time_limit:
-                            # Concatenate all chunks into a single message
-                            if audio_buffer:
-                                combined_message = b''.join(audio_buffer)
-                                await self.websocket.send(combined_message)
-                                print(f"Sent batch of {len(audio_buffer)} chunks as single message ({len(combined_message)} bytes)")
-                                audio_buffer = []
-                                last_send_time = time.time()
-                    
-                    # Send any remaining chunks in the buffer
-                    if audio_buffer:
-                        combined_message = b''.join(audio_buffer)
-                        await self.websocket.send(combined_message)
-                        print(f"Sent final batch of {len(audio_buffer)} chunks as single message ({len(combined_message)} bytes)")
+                        # Send any remaining chunks in the buffer
+                        if audio_buffer:
+                            combined_message = b''.join(audio_buffer)
+                            await self.websocket.send(combined_message)
+                            print(f"Sent final batch of {len(audio_buffer)} chunks as single message ({len(combined_message)/1024:.1f} KB)")
                 
                 # Send end of stream marker
                 await self.websocket.send(json.dumps({"type": "end"}))
-                print(f"Streaming completed in {(time.time() - start_time)*1000:.0f}ms")
+                total_time = time.time() - start_time
+                print(f"Streaming completed in {total_time*1000:.0f}ms")
                 
         except Exception as e:
             print(f"Error in generation: {e}")
@@ -391,56 +370,34 @@ class StreamingTTSSession:
         finally:
             self.is_generating = False
             # If more text was added during generation, start a new generation
-            if self.has_enough_complete_words():
+            if self.has_complete_sentence():
                 self.generation_task = asyncio.create_task(self.generate_from_buffer())
+
+    async def generate_hardcoded_speech(self):
+        """Split hardcoded speech into sentences for more natural delivery"""
+        # Split the hardcoded speech into sentences
+        import re
+        sentences = re.split(r'(?<=[.!?])\s+', HARDCODED_SPEECH)
+        for sentence in sentences:
+            if sentence.strip():
+                print(f"Adding sentence: '{sentence}'")
+                await self.add_text(sentence + " ")
+                # Wait for this sentence to process before adding the next
+                while self.is_generating:
+                    await asyncio.sleep(0.1)
+        
+        print("All sentences queued")
 
 async def handle_websocket(websocket):
     """Handle incoming websocket connections"""
     try:
         # Create a streaming session for this connection
-        session = None
-        
-        # Auto-start with hardcoded text instead of waiting for client
-        print("Auto-starting with hardcoded text (no client input needed)")
         session = StreamingTTSSession(websocket, "en-us")
-        await session.add_text(HARDCODED_SPEECH)
         
-        # Comment out the original client handling code
-        """
-        async for message in websocket:
-            data = json.loads(message)
-            
-            if data["type"] == "start_session":
-                # Initialize a new streaming session
-                language = data.get("language", "en-us")
-                session = StreamingTTSSession(websocket, language)
-                await websocket.send(json.dumps({"type": "session_started"}))
-                
-            elif data["type"] == "add_text" and session:
-                # Add text to the current session
-                text = data.get("text", "")
-                if text:
-                    await session.add_text(text)
-                    
-            elif data["type"] == "end_session" and session:
-                # End the current session
-                if session.generation_task and not session.generation_task.done():
-                    session.generation_task.cancel()
-                session = None
-                await websocket.send(json.dumps({"type": "session_ended"}))
-                
-            elif data["type"] == "generate":
-                # One-off generation for compatibility
-                text = data.get("text", "")
-                language = data.get("language", "en-us")
-                if text:
-                    # Create a temporary session and generate the complete text
-                    temp_session = StreamingTTSSession(websocket, language)
-                    await temp_session.add_text(text)
-                    while temp_session.text_buffer:
-                        await temp_session.generate_from_buffer()
-        """
-                
+        # Auto-start with hardcoded text, split into natural sentences
+        print("Auto-starting with hardcoded text (no client input needed)")
+        await session.generate_hardcoded_speech()
+        
         # Keep the server running after generating the hardcoded text
         await asyncio.Future()
                 
@@ -460,8 +417,15 @@ async def main():
     host = "0.0.0.0"  # Listen on all interfaces
     port = 8765
     
-    print(f"Starting H100-optimized websocket server on {host}:{port}")
-    async with websockets.serve(handle_websocket, host, port):
+    print(f"Starting GH200-optimized websocket server on {host}:{port}")
+    async with websockets.serve(
+        handle_websocket, 
+        host, 
+        port,
+        max_size=10_000_000,  # 10MB max message size
+        max_queue=32,         # Larger queue for GH200
+        ping_timeout=300,     # Longer timeout
+    ):
         await asyncio.Future()  # Run forever
 
 if __name__ == "__main__":
@@ -470,5 +434,10 @@ if __name__ == "__main__":
     print(f"CUDA device: {torch.cuda.get_device_name(0)}")
     print(f"CUDA version: {torch.version.cuda}")
     print(f"PyTorch version: {torch.__version__}")
+    
+    # GH200 optimization: run garbage collection before starting
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
     
     asyncio.run(main())
