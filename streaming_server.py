@@ -308,14 +308,14 @@ class StreamingTTSSession:
                         stream_generator = model.stream(
                             prefix_conditioning=conditioning,
                             audio_prefix_codes=None,
-                            chunk_schedule=[64, 128, 256, 512],  # Smaller initial chunks for faster startup
-                            chunk_overlap=8,  # Overlap smaller than smallest chunk
+                            chunk_schedule=[64, 64, 64, 64],  # Smaller initial chunks for faster startup
+                            chunk_overlap=32,  # Overlap smaller than smallest chunk
                         )
                         
                         # Buffer for batching audio chunks
                         audio_buffer = []
                         buffer_size_limit = 2  # Smaller batches for more frequent updates
-                        buffer_time_limit = 0.05  # Shorter time limit for more responsive delivery
+                        buffer_time_limit = 0.01  # Shorter time limit for more responsive delivery
                         last_send_time = time.time()
                         
                         for audio_chunk in stream_generator:

@@ -78,7 +78,7 @@
         <button id="clearLogBtn">Clear Log</button>
     </div>
     
-    <audio id="audioPlayer" controls autoplay></audio>
+    <audio id="audioPlayer" controls></audio>
     
     <div class="stats">
         <h2>Performance Metrics</h2>
@@ -122,6 +122,68 @@
         let lastChunkTime = null;
         let chunkTimes = [];
         let totalChunks = 0;
+        
+        // WebAudio components
+        let audioContext = null;
+        let audioQueue = [];
+        let isPlaying = false;
+        let nextPlayTime = 0;
+        let sampleRate = 44100;
+        
+        // Initialize Web Audio API
+        function initAudio() {
+            if (audioContext) {
+                audioContext.close();
+            }
+            
+            audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            audioQueue = [];
+            isPlaying = false;
+            nextPlayTime = 0;
+        }
+        
+        // Convert WAV blob to AudioBuffer
+        async function wavToAudioBuffer(wavBlob) {
+            const arrayBuffer = await wavBlob.arrayBuffer();
+            return await audioContext.decodeAudioData(arrayBuffer);
+        }
+        
+        // Process the audio queue and play chunks in sequence
+        function processAudioQueue() {
+            if (!isPlaying && audioQueue.length > 0) {
+                playNextInQueue();
+            }
+        }
+        
+        // Play the next chunk in the queue
+        function playNextInQueue() {
+            if (audioQueue.length === 0) {
+                isPlaying = false;
+                return;
+            }
+            
+            isPlaying = true;
+            const chunk = audioQueue.shift();
+            
+            // If this is the first chunk or we're behind real-time
+            if (nextPlayTime <= audioContext.currentTime) {
+                nextPlayTime = audioContext.currentTime;
+            }
+            
+            // Create source and connect
+            const source = audioContext.createBufferSource();
+            source.buffer = chunk.buffer;
+            source.connect(audioContext.destination);
+            
+            // Schedule playback
+            source.start(nextPlayTime);
+            
+            // Calculate next play time
+            nextPlayTime += chunk.buffer.duration;
+            
+            // Schedule next chunk to play when this one finishes
+            source.onended = playNextInQueue;
+        }
         
         // Add log entry with timestamp
         function log(message, type = '') {
@@ -167,7 +229,7 @@
         }
         
         // Connect to WebSocket server
-        function connect() {
+        async function connect() {
             if (isConnected) {
                 websocket.close();
                 return;
@@ -181,9 +243,12 @@
             totalChunks = 0;
             updateStats();
             
+            // Initialize WebAudio
+            initAudio();
+            
             log('Connecting to TTS server...');
             
-            // Connect to the Lambda TTS server
+            // Connect to the TTS server
             websocket = new WebSocket('ws://localhost:8765');
             
             websocket.onopen = function() {
@@ -221,7 +286,7 @@
                 log(`WebSocket error: ${error}`, 'metadata');
             };
             
-            websocket.onmessage = function(event) {
+            websocket.onmessage = async function(event) {
                 const now = Date.now();
                 
                 if (typeof event.data === 'string') {
@@ -229,6 +294,11 @@
                     try {
                         const data = JSON.parse(event.data);
                         log(`Received metadata: ${JSON.stringify(data)}`, 'metadata');
+                        
+                        // Update sample rate from metadata if available
+                        if (data.sampling_rate) {
+                            sampleRate = data.sampling_rate;
+                        }
                     } catch (e) {
                         log(`Received text: ${event.data}`, 'metadata');
                     }
@@ -247,20 +317,23 @@
                     const size = event.data.size / 1024;
                     log(`Chunk #${totalChunks} | ${size.toFixed(1)} KB | +${(timeSinceLastChunk/1000).toFixed(3)}s`, 'audio-chunk');
                     
-                    // Play the audio
-                    const blob = new Blob([event.data], { type: 'audio/wav' });
-                    const url = URL.createObjectURL(blob);
-                    
-                    // Clean up previous URL after playing
-                    const oldUrl = audioPlayer.src;
-                    if (oldUrl && oldUrl.startsWith('blob:')) {
-                        URL.revokeObjectURL(oldUrl);
+                    try {
+                        // Convert the WAV blob to an AudioBuffer
+                        const audioBuffer = await wavToAudioBuffer(event.data);
+                        
+                        // Add to the playback queue
+                        audioQueue.push({
+                            buffer: audioBuffer,
+                            timestamp: now
+                        });
+                        
+                        // Try to process the queue (will start playback if not already playing)
+                        processAudioQueue();
+                        
+                        updateStats();
+                    } catch (error) {
+                        log(`Error processing audio: ${error}`, 'metadata');
                     }
-                    
-                    audioPlayer.src = url;
-                    audioPlayer.play();
-                    
-                    updateStats();
                 }
             };
         }
