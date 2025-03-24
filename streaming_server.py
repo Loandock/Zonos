@@ -23,7 +23,7 @@ warnings.filterwarnings("ignore", category=UserWarning, module="torch.cuda.graph
 
 # Path to your custom voice sample
 CUSTOM_VOICE_PATH = "sesame_fine_tune.wav"
-HARDCODED_SPEECH = "Heyy! So... sure lemme walk you through the mortgage process. Basically, we start by looking at your finances, like your credit and income, and then we figure out which loan works best for you. We run these numbers through the underwriter's software to kinda se if they'll let you take it out, you know? It might sound like a lot at first, but I'm here to help you every step of the way. So, if that sounds good, just lemme know, and we can get started right away!"
+HARDCODED_SPEECH = "Hey, how are you doing John! So sure lemme walk you through the mortgage process. Basically, we start by looking at your finances, like your credit and income, and then we figure out which loan works best for you. We run these numbers through the underwriter's software to kinda se if they'll let you take it out, you know? It might sound like a lot at first, but I'm here to help you every step of the way. So, if that sounds good, just lemme know, and we can get started right away!"
 
 # GH200-specific optimizations
 torch.set_float32_matmul_precision('high')  # Use TF32 for matrix multiplications
@@ -270,8 +270,17 @@ class StreamingTTSSession:
                 # Detect content type and adjust parameters
                 content_type = self.detect_content_type(complete_text)
                 
+                # Adjust speaking rate more aggressively  
+                speaking_rate = 14  # Increase base rate to speed up overall delivery
+                
+                # Reduce pauses at punctuation especially commas
+                if ',' in complete_text:
+                    speaking_rate += 3  # Speed up comma-separated phrases significantly
+                    
+                if '.' in complete_text or '!' in complete_text or '?' in complete_text:
+                    speaking_rate += 1  # Speed up even sentence endings
+                
                 # Adjust speaking rate based on content type
-                speaking_rate = 13  # Base rate
                 speaking_rate += content_type['speaking_rate_modifier']
                 
                 # Create conditioning dictionary with optimized parameters for voice cloning
@@ -299,7 +308,7 @@ class StreamingTTSSession:
                 chunk_counter = 0
                 
                 # GH200-optimized generation with BFloat16
-                with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                with torch.amp.autocast('cuda', dtype=torch.bfloat16):
                     with torch.no_grad():
                         # Prepare conditioning - do this outside the stream to avoid overhead
                         conditioning = model.prepare_conditioning(cond_dict)
@@ -308,8 +317,8 @@ class StreamingTTSSession:
                         stream_generator = model.stream(
                             prefix_conditioning=conditioning,
                             audio_prefix_codes=None,
-                            chunk_schedule=[64, 64, 64, 64],  # Smaller initial chunks for faster startup
-                            chunk_overlap=32,  # Overlap smaller than smallest chunk
+                            chunk_schedule=[128, 256],  # More gradual size increases
+                            chunk_overlap=32,  # Smaller overlap but still enough for transitions
                         )
                         
                         # Buffer for batching audio chunks
